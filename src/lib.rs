@@ -48,6 +48,7 @@ mod ffi;
 
 extern crate boxfnonce;
 extern crate libc;
+extern crate nix;
 
 use std::env::set_current_dir;
 use std::ffi::CString;
@@ -444,13 +445,22 @@ unsafe fn set_sid() -> Result<()> {
 }
 
 unsafe fn redirect_standard_streams(stdin: Stdio, stdout: Stdio, stderr: Stdio) -> Result<()> {
+    // To prevent issues, we don't want to try to close file descriptors that were already closed.
+    use nix::fcntl::{fcntl, FcntlArg};
+    let was_stdin_open = fcntl(libc::STDIN_FILENO, FcntlArg::F_GETFD).is_ok();
+    let was_stdout_open = fcntl(libc::STDOUT_FILENO, FcntlArg::F_GETFD).is_ok();
+    let was_stderr_open = fcntl(libc::STDERR_FILENO, FcntlArg::F_GETFD).is_ok();
+
+    // Open the /dev/null filehandle
     let devnull_fd = open(b"/dev/null\0" as *const [u8; 10] as _, libc::O_RDWR);
     if -1 == devnull_fd {
         return Err(DaemonizeError::RedirectStreams(errno()));
     }
 
+    // Define a block that will be called below. Closes each file handle
     let process_stdio = |fd, stdio: Stdio| {
         tryret!(close(fd), (), DaemonizeError::RedirectStreams);
+
         match stdio.inner {
             StdioImp::Devnull => {
                 tryret!(dup2(devnull_fd, fd), (), DaemonizeError::RedirectStreams);
@@ -463,10 +473,18 @@ unsafe fn redirect_standard_streams(stdin: Stdio, stdout: Stdio, stderr: Stdio) 
         Ok(())
     };
 
-    process_stdio(libc::STDIN_FILENO, stdin)?;
-    process_stdio(libc::STDOUT_FILENO, stdout)?;
-    process_stdio(libc::STDERR_FILENO, stderr)?;
+    // Go through each STD* and close it
+    if was_stdin_open {
+        process_stdio(libc::STDIN_FILENO, stdin)?;
+    }
+    if was_stdout_open {
+        process_stdio(libc::STDOUT_FILENO, stdout)?;
+    }
+    if was_stderr_open {
+        process_stdio(libc::STDERR_FILENO, stderr)?;
+    }
 
+    // Finally close the /dev/null fd as well
     tryret!(close(devnull_fd), (), DaemonizeError::RedirectStreams);
 
     Ok(())
